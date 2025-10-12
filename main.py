@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 from base64 import urlsafe_b64decode
 import os
 from dotenv import load_dotenv
@@ -8,7 +9,6 @@ from dotenv import load_dotenv
 load_dotenv()
 app = FastAPI()
 
-# Step 1: Get Google OAuth URL for Gmail access
 @app.get("/auth/gmail/login")
 async def gmail_login():
     flow = Flow.from_client_config(
@@ -27,7 +27,6 @@ async def gmail_login():
     auth_url, _ = flow.authorization_url(prompt="consent")
     return {"auth_url": auth_url}
 
-# Step 2: Handle OAuth callback, scan emails, return results
 @app.get("/auth/gmail/callback")
 async def gmail_callback(code: str):
     flow = Flow.from_client_config(
@@ -46,9 +45,9 @@ async def gmail_callback(code: str):
     flow.fetch_token(code=code)
     access_token = flow.credentials.token
 
-    # Fetch emails using access token
-    service = build('gmail', 'v1', credentials=None)
-    service._http.credentials = type('', (), {'token': access_token, 'refresh': lambda: None})()
+    # ✅ Fix: Use Credentials object (no ADC error)
+    creds = Credentials(access_token)
+    service = build('gmail', 'v1', credentials=creds)
 
     messages = service.users().messages().list(userId='me', maxResults=5).execute()
     result = []
@@ -74,13 +73,12 @@ async def gmail_callback(code: str):
             except:
                 body = ""
 
-        # Scam detection (replace with real model later)
+        # Scam detection
         is_scam = "win" in subject.lower() or "free" in subject.lower() or "urgent" in body.lower()
         label = "Scam" if is_scam else "Safe"
         confidence = 95 if is_scam else 10
         explanation = "Suspicious keywords detected." if is_scam else "No threats found."
 
-        # NFR-001: Only store metadata + scan result (no raw body)
         result.append({
             "message_id": msg['id'],
             "subject": subject,
