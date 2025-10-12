@@ -1,25 +1,16 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from base64 import urlsafe_b64decode
 import os
 from dotenv import load_dotenv
-from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
 app = FastAPI()
 
-# Simulate authenticated user (replace with real auth later)
-async def get_current_user():
-    return {"email": "user@example.com"}
-
-@app.on_event("startup")
-async def startup():
-    app.mongodb = AsyncIOMotorClient(os.getenv("MONGODB_URL"))[os.getenv("DB_NAME")]
-
-# Step 1: Get Google OAuth URL
-@app.get("/auth/gmail/initiate")
-async def gmail_initiate():
+# Step 1: Get Google OAuth URL for Gmail access
+@app.get("/auth/gmail/login")
+async def gmail_login():
     flow = Flow.from_client_config(
         {
             "web": {
@@ -36,9 +27,9 @@ async def gmail_initiate():
     auth_url, _ = flow.authorization_url(prompt="consent")
     return {"auth_url": auth_url}
 
-# Step 2: Handle OAuth callback and save tokens
+# Step 2: Handle OAuth callback, scan emails, return results
 @app.get("/auth/gmail/callback")
-async def gmail_callback(code: str, user=Depends(get_current_user)):
+async def gmail_callback(code: str):
     flow = Flow.from_client_config(
         {
             "web": {
@@ -53,29 +44,11 @@ async def gmail_callback(code: str, user=Depends(get_current_user)):
     )
     flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
     flow.fetch_token(code=code)
-    
-    # Save tokens to user account
-    await app.mongodb.users.update_one(
-        {"email": user["email"]},
-        {
-            "$set": {
-                "gmail_access_token": flow.credentials.token,
-                "gmail_refresh_token": flow.credentials.refresh_token
-            }
-        },
-        upsert=True
-    )
-    return {"message": "Gmail connected"}
+    access_token = flow.credentials.token
 
-# Step 3: Fetch and scan emails
-@app.get("/gmail/emails")
-async def get_gmail_emails(user=Depends(get_current_user)):
-    user_doc = await app.mongodb.users.find_one({"email": user["email"]})
-    if not user_doc or not user_doc.get("gmail_access_token"):
-        raise HTTPException(400, "Gmail not connected")
-    
+    # Fetch emails using access token
     service = build('gmail', 'v1', credentials=None)
-    service._http.credentials = type('', (), {'token': user_doc["gmail_access_token"], 'refresh': lambda: None})()
+    service._http.credentials = type('', (), {'token': access_token, 'refresh': lambda: None})()
 
     messages = service.users().messages().list(userId='me', maxResults=5).execute()
     result = []
@@ -107,6 +80,7 @@ async def get_gmail_emails(user=Depends(get_current_user)):
         confidence = 95 if is_scam else 10
         explanation = "Suspicious keywords detected." if is_scam else "No threats found."
 
+        # NFR-001: Only store metadata + scan result (no raw body)
         result.append({
             "message_id": msg['id'],
             "subject": subject,
