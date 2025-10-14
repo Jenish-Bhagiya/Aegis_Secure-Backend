@@ -1,16 +1,91 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from base64 import urlsafe_b64decode
 import os
-from dotenv import load_dotenv
+import httpx
+from motor.motor_asyncio import AsyncIOMotorClient
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+import jwt
+from pydantic import BaseModel
 
-load_dotenv()
+# --- Config ---
 app = FastAPI()
+SECRET_KEY = os.getenv("JWT_SECRET", "your_strong_secret_here")
+ALGORITHM = "HS256"
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-@app.get("/auth/gmail/login")
-async def gmail_login():
+# --- MongoDB Setup ---
+@app.on_event("startup")
+async def startup():
+    app.mongodb = AsyncIOMotorClient(os.getenv("MONGODB_URL"))[os.getenv("DB_NAME")]
+
+# --- Models ---
+class UserInDB(BaseModel):
+    email: str
+    hashed_password: str
+    gmail_accounts: list = []
+
+class TokenData(BaseModel):
+    email: str
+
+# --- Auth Helpers ---
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token( dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(hours=24))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(request: Request):
+    token = request.headers.get("Authorization")
+    if not token or not token.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = token.split(" ")[1]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(401, "Invalid token")
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Invalid token")
+    
+    user = await app.mongodb.users.find_one({"email": email})
+    if user is None:
+        raise HTTPException(401, "User not found")
+    return user
+
+# --- Auth Endpoints ---
+@app.post("/auth/signup")
+async def signup(email: str, password: str):
+    if await app.mongodb.users.find_one({"email": email}):
+        raise HTTPException(400, "Email already registered")
+    hashed_pw = get_password_hash(password)
+    await app.mongodb.users.insert_one({
+        "email": email,
+        "hashed_password": hashed_pw,
+        "gmail_accounts": []
+    })
+    return {"message": "User created"}
+
+@app.post("/auth/login")
+async def login(email: str, password: str):
+    user = await app.mongodb.users.find_one({"email": email})
+    if not user or not verify_password(password, user["hashed_password"]):
+        raise HTTPException(401, "Invalid credentials")
+    access_token = create_access_token(data={"sub": email})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# --- Gmail Integration ---
+@app.get("/auth/gmail/initiate")
+async def gmail_initiate(user=Depends(get_current_user)):
     flow = Flow.from_client_config(
         {
             "web": {
@@ -24,11 +99,11 @@ async def gmail_login():
         scopes=["https://www.googleapis.com/auth/gmail.readonly"]
     )
     flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
-    auth_url, _ = flow.authorization_url(prompt="consent")
+    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
     return {"auth_url": auth_url}
 
 @app.get("/auth/gmail/callback")
-async def gmail_callback(code: str):
+async def gmail_callback(code: str, user=Depends(get_current_user)):
     flow = Flow.from_client_config(
         {
             "web": {
@@ -43,50 +118,99 @@ async def gmail_callback(code: str):
     )
     flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
     flow.fetch_token(code=code)
-    access_token = flow.credentials.token
 
-    # ✅ Fix: Use Credentials object (no ADC error)
-    creds = Credentials(access_token)
+    # Get user email from Gmail
+    creds = Credentials(flow.credentials.token)
     service = build('gmail', 'v1', credentials=creds)
+    profile = service.users().getProfile(userId='me').execute()
+    gmail_email = profile['emailAddress']
 
-    messages = service.users().messages().list(userId='me', maxResults=5).execute()
+    # Save account securely in user document
+    await app.mongodb.users.update_one(
+        {"email": user["email"]},
+        {"$addToSet": {
+            "gmail_accounts": {
+                "email": gmail_email,
+                "access_token": flow.credentials.token,
+                "refresh_token": flow.credentials.refresh_token,
+                "connected_at": datetime.utcnow().isoformat()
+            }
+        }}
+    )
+    return """
+    <html><body>
+        <h2>✅ Gmail connected!</h2>
+        <a href="aegissecure://gmail-connected">Open Aegis Secure</a>
+    </body></html>
+    """
+
+# --- Fetch & Scan Emails ---
+@app.get("/gmail/emails")
+async def get_emails(account_email: str, user=Depends(get_current_user)):
+    # Find account
+    account = next((acc for acc in user.get("gmail_accounts", []) if acc["email"] == account_email), None)
+    if not account:
+        raise HTTPException(400, "Account not connected")
+
+    # Fetch emails
+    creds = Credentials(account["access_token"])
+    service = build('gmail', 'v1', credentials=creds)
+    messages = service.users().messages().list(userId='me', maxResults=20).execute()
     result = []
 
-    for msg in messages.get('messages', []):
-        raw = service.users().messages().get(userId='me', id=msg['id']).execute()
-        headers = {h['name'].lower(): h['value'] for h in raw['payload']['headers']}
-        subject = headers.get('subject', '(No subject)')
-        sender = headers.get('from', 'Unknown')
-        date = headers.get('date', '')
+    async with httpx.AsyncClient() as client:
+        for msg in messages.get('messages', []):
+            raw = service.users().messages().get(userId='me', id=msg['id']).execute()
+            headers = {h['name'].lower(): h['value'] for h in raw['payload']['headers']}
+            subject = headers.get('subject', '(No subject)')
+            sender = headers.get('from', 'Unknown')
+            date = headers.get('date', '')
 
-        body = ""
-        if 'parts' in raw['payload']:
-            for part in raw['payload']['parts']:
-                if part['mimeType'] == 'text/plain':
-                    body = part['body'].get('data', '')
-                    break
-        elif 'body' in raw['payload']:
-            body = raw['payload']['body'].get('data', '')
-        if body:
+            # Extract body
+            body = ""
+            if 'parts' in raw['payload']:
+                for part in raw['payload']['parts']:
+                    if part['mimeType'] == 'text/plain':
+                        body = part['body'].get('data', '')
+                        break
+            elif 'body' in raw['payload']:
+                body = raw['payload']['body'].get('data', '')
+            if body:
+                try:
+                    body = urlsafe_b64decode(body).decode('utf-8', errors='ignore')
+                except:
+                    body = ""
+
+            # Send to ML model
             try:
-                body = urlsafe_b64decode(body).decode('utf-8', errors='ignore')
+                ml_resp = await client.post(
+                    "https://cybersecure-backend-api.onrender.com/predict",
+                    json={"text": f"{subject}\n{body}"}
+                )
+                prediction = ml_resp.json().get("prediction", "ham")
             except:
-                body = ""
+                prediction = "ham"
 
-        # Scam detection
-        is_scam = "win" in subject.lower() or "free" in subject.lower() or "urgent" in body.lower()
-        label = "Scam" if is_scam else "Safe"
-        confidence = 95 if is_scam else 10
-        explanation = "Suspicious keywords detected." if is_scam else "No threats found."
+            # Map to your format
+            label = "Scam" if prediction == "spam" else "Safe"
+            confidence = 95 if label == "Scam" else 10
+            explanation = "Suspicious content detected." if label == "Scam" else "No threats found."
 
-        result.append({
-            "message_id": msg['id'],
-            "subject": subject,
-            "sender": sender,
-            "timestamp": date,
-            "label": label,
-            "confidence_score": confidence,
-            "explanation": explanation
-        })
+            result.append({
+                "message_id": msg['id'],
+                "subject": subject,
+                "sender": sender,
+                "timestamp": date,
+                "label": label,
+                "confidence_score": confidence,
+                "explanation": explanation,
+                "body": body  # Only for detail view (not stored long-term)
+            })
 
     return {"emails": result}
+
+# --- List Connected Accounts ---
+@app.get("/gmail/accounts")
+async def get_accounts(user=Depends(get_current_user)):
+    accounts = [acc["email"] for acc in user.get("gmail_accounts", [])]
+    return {"accounts": accounts}
