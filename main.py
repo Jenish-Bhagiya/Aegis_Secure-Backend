@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, Form
+from fastapi.responses import HTMLResponse
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
@@ -45,10 +46,9 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(request: Request):
-    token = request.headers.get("Authorization")
-    if not token or not token.startswith("Bearer "):
+    token = request.cookies.get("access_token")
+    if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    token = token.split(" ")[1]
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
@@ -64,7 +64,7 @@ async def get_current_user(request: Request):
 
 # --- Auth Endpoints ---
 @app.post("/auth/signup")
-async def signup(email: str, password: str):
+async def signup(email: str = Form(...), password: str = Form(...)):
     if await app.mongodb.users.find_one({"email": email}):
         raise HTTPException(400, "Email already registered")
     hashed_pw = get_password_hash(password)
@@ -76,12 +76,14 @@ async def signup(email: str, password: str):
     return {"message": "User created"}
 
 @app.post("/auth/login")
-async def login(email: str, password: str):
+async def login(response: HTMLResponse, email: str = Form(...), password: str = Form(...)):
     user = await app.mongodb.users.find_one({"email": email})
     if not user or not verify_password(password, user["hashed_password"]):
         raise HTTPException(401, "Invalid credentials")
     access_token = create_access_token(data={"sub": email})
-    return {"access_token": access_token, "token_type": "bearer"}
+    response = HTMLResponse(content="<script>localStorage.setItem('token', '{}'); window.location.href='/mail';</script>".format(access_token))
+    response.set_cookie(key="access_token", value=access_token, httponly=True, secure=True, samesite="lax")
+    return response
 
 # --- Gmail Integration ---
 @app.get("/auth/gmail/initiate")
@@ -119,13 +121,11 @@ async def gmail_callback(code: str, user=Depends(get_current_user)):
     flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
     flow.fetch_token(code=code)
 
-    # Get user email from Gmail
     creds = Credentials(flow.credentials.token)
     service = build('gmail', 'v1', credentials=creds)
     profile = service.users().getProfile(userId='me').execute()
     gmail_email = profile['emailAddress']
 
-    # Save account securely in user document
     await app.mongodb.users.update_one(
         {"email": user["email"]},
         {"$addToSet": {
@@ -137,22 +137,20 @@ async def gmail_callback(code: str, user=Depends(get_current_user)):
             }
         }}
     )
-    return """
+    return HTMLResponse(content="""
     <html><body>
         <h2>✅ Gmail connected!</h2>
-        <a href="aegissecure://gmail-connected">Open Aegis Secure</a>
+        <a href="/mail">Go to Mail</a>
     </body></html>
-    """
+    """)
 
 # --- Fetch & Scan Emails ---
 @app.get("/gmail/emails")
 async def get_emails(account_email: str, user=Depends(get_current_user)):
-    # Find account
     account = next((acc for acc in user.get("gmail_accounts", []) if acc["email"] == account_email), None)
     if not account:
         raise HTTPException(400, "Account not connected")
 
-    # Fetch emails
     creds = Credentials(account["access_token"])
     service = build('gmail', 'v1', credentials=creds)
     messages = service.users().messages().list(userId='me', maxResults=20).execute()
@@ -166,7 +164,6 @@ async def get_emails(account_email: str, user=Depends(get_current_user)):
             sender = headers.get('from', 'Unknown')
             date = headers.get('date', '')
 
-            # Extract body
             body = ""
             if 'parts' in raw['payload']:
                 for part in raw['payload']['parts']:
@@ -181,7 +178,6 @@ async def get_emails(account_email: str, user=Depends(get_current_user)):
                 except:
                     body = ""
 
-            # Send to ML model
             try:
                 ml_resp = await client.post(
                     "https://cybersecure-backend-api.onrender.com/predict",
@@ -191,7 +187,6 @@ async def get_emails(account_email: str, user=Depends(get_current_user)):
             except:
                 prediction = "ham"
 
-            # Map to your format
             label = "Scam" if prediction == "spam" else "Safe"
             confidence = 95 if label == "Scam" else 10
             explanation = "Suspicious content detected." if label == "Scam" else "No threats found."
@@ -204,12 +199,12 @@ async def get_emails(account_email: str, user=Depends(get_current_user)):
                 "label": label,
                 "confidence_score": confidence,
                 "explanation": explanation,
-                "body": body  # Only for detail view (not stored long-term)
+                "body": body
             })
 
     return {"emails": result}
 
-# --- List Connected Accounts ---
+# --- List Accounts ---
 @app.get("/gmail/accounts")
 async def get_accounts(user=Depends(get_current_user)):
     accounts = [acc["email"] for acc in user.get("gmail_accounts", [])]
