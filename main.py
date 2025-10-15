@@ -11,6 +11,8 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import jwt
 from pydantic import BaseModel
+from dotenv import load_dotenv
+load_dotenv()
 
 # --- Config ---
 app = FastAPI()
