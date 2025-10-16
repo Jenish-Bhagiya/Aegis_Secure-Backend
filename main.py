@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import jwt
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # --- Config ---
@@ -143,9 +144,9 @@ async def gmail_callback(code: str, user=Depends(get_current_user)):
             }
         }}
     )
-    return HTMLResponse(content="""
+    return HTMLResponse(content=f"""
     <html><body>
-        <h2>✅ Gmail connected!</h2>
+        <h2>✅ Gmail connected: {gmail_email}</h2>
         <a href="/mail">Go to Mail</a>
     </body></html>
     """)
@@ -184,7 +185,7 @@ async def get_emails(account_email: str, user=Depends(get_current_user)):
                 except:
                     body = ""
 
-            # === SEND TO ML MODEL ===
+            # === Send to ML model ===
             try:
                 ml_resp = await client.post(
                     "https://cybersecure-backend-api.onrender.com/predict",
