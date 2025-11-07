@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from websocket_manager import broadcast_new_email
 from datetime import datetime, timezone
 
-from fcm_service import send_fcm_notification_for_user
+from .fcm_service import send_fcm_notification_for_user
 from database import users_col
 
 load_dotenv()

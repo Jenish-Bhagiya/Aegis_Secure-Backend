@@ -71,7 +71,7 @@ import os
 from fastapi.encoders import jsonable_encoder
 from bson import ObjectId
 
-from fcm_service import send_fcm_notification_for_user
+from .fcm_service import send_fcm_notification_for_user
 from database import users_col
 
 router = APIRouter()
