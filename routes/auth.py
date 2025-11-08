@@ -226,7 +226,6 @@ async def get_user_info(credentials: HTTPAuthorizationCredentials = Depends(secu
         "name": user["name"],
         "email": user["email"],
         "verified": user.get("verified", False),
-        "user_id": user.get("user_id", "unknown")  # for debug
     }
 
 
