@@ -103,18 +103,37 @@ async def sync_sms(request: SmsSyncRequest, current_user: dict = Depends(get_cur
         score = float(message_doc.get("spam_score", 0))
         label = message_doc.get("scan_result", message_doc.get("spam_prediction", "Unknown"))
 
-        if pref == "all" or (pref == "high_only" and score >= 70): 
-            await send_fcm_notification_for_user(
-                user_id,
-                title="New SMS Alert",
-                body=f"{label} message detected — Score: {int(score)}",
-                data={
-                    "type": "sms",
-                    "score": str(int(score)),
-                    "label": label,
-                    "timestamp": str(message_doc["timestamp"]),
-                },
-            )
+        # if pref == "all" or (pref == "high_only" and score >= 70): 
+        if True:
+            # await send_fcm_notification_for_user(
+            #     user_id,
+            #     title="New SMS Alert",
+            #     body=f"{label} message detected — Score: {int(score)}",
+            #     data={
+            #         "type": "sms",
+            #         "score": str(int(score)),
+            #         "label": label,
+            #         "timestamp": str(message_doc["timestamp"]),
+            #     },
+            # )
+            print(f"🔔 Preparing to send FCM for user={user_id}, score={score}, label={label}")
+
+            try:
+                await send_fcm_notification_for_user(
+                    user_id,
+                    title="New SMS Alert",
+                    body=f"{label} message detected — Score: {int(score)}",
+                    data={
+                        "type": "sms",
+                        "score": str(int(score)),
+                        "label": label,
+                        "timestamp": str(message_doc.get("timestamp", "")),
+                    },
+                )
+                print("✅ FCM send function executed successfully")
+            except Exception as e:
+                print("❌ FCM send failed:", e)
+
 
 
     return {
