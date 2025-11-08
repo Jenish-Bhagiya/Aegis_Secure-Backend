@@ -1,4 +1,4 @@
-import os, json, asyncio
+import os, json, asyncio, base64
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 import firebase_admin
@@ -9,24 +9,24 @@ load_dotenv()
 
 
 def _init_firebase():
-    """Initialize Firebase Admin once (Render + local support)."""
+    """Initialize Firebase Admin once (Base64 or local JSON support)."""
     if firebase_admin._apps:
         return
 
-    creds_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
-    creds_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
-
     try:
-        if creds_path and os.path.exists(creds_path):
+        # Prefer Base64 env var for Render (safe for long JSON)
+        b64_data = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64")
+        creds_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
+
+        if b64_data:
+            creds_dict = json.loads(base64.b64decode(b64_data))
+            cred = credentials.Certificate(creds_dict)
+            print("✅ Firebase initialized using Base64 environment variable.")
+        elif creds_path and os.path.exists(creds_path):
             cred = credentials.Certificate(creds_path)
             print("✅ Firebase initialized using service-account.json file.")
-        elif creds_json:
-            # Convert escaped \n to actual newlines (important for Render)
-            clean_json = creds_json.replace("\\n", "\n")
-            cred = credentials.Certificate(json.loads(clean_json))
-            print("✅ Firebase initialized using FIREBASE_SERVICE_ACCOUNT_JSON.")
         else:
-            raise RuntimeError("❌ Firebase credentials missing in environment.")
+            raise RuntimeError("❌ Firebase credentials not found in environment.")
 
         firebase_admin.initialize_app(cred)
         print("✅ Firebase Admin SDK successfully initialized!")
