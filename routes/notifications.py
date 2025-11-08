@@ -134,7 +134,13 @@ async def gmail_notifications(request: Request):
 
         # Send FCM push
         try:
-            user_doc = await users_col.find_one({"email": user.get("email")})
+            # Find the main Aegis account owning this Gmail account
+            user_doc = await users_col.find_one({"user_id": user.get("user_id")})
+            if not user_doc:
+                print(f"⚠️ No user_doc found for user_id={user.get('user_id')} (gmail={email_address})")
+            else:
+                print(f"🔍 Found user_doc for {user_doc.get('email')} with {len(user_doc.get('fcm_tokens', []))} tokens.")
+
             if user_doc:
                 user_id = user_doc.get("user_id")
                 label = str(spam_prediction)
