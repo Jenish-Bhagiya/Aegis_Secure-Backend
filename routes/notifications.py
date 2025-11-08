@@ -7,6 +7,8 @@ from database import messages_col, accounts_col, users_col
 from websocket_manager import broadcast_new_email
 from .fcm_service import send_fcm_notification_for_user
 
+from bson import ObjectId
+
 load_dotenv()
 
 router = APIRouter()
@@ -134,15 +136,19 @@ async def gmail_notifications(request: Request):
 
         # Send FCM push
         try:
-            # Find the main Aegis account owning this Gmail account
-            user_doc = await users_col.find_one({"user_id": user.get("user_id")})
+            # Try matching by both string user_id and ObjectId
+            uid = user.get("user_id")
+            query = {"$or": [{"user_id": uid}, {"_id": ObjectId(uid) if len(uid) == 24 else uid}]}
+
+            user_doc = await users_col.find_one(query)
+
             if not user_doc:
-                print(f"⚠️ No user_doc found for user_id={user.get('user_id')} (gmail={email_address})")
+                print(f"⚠️ No user_doc found for user_id={uid} (gmail={email_address})")
             else:
                 print(f"🔍 Found user_doc for {user_doc.get('email')} with {len(user_doc.get('fcm_tokens', []))} tokens.")
 
             if user_doc:
-                user_id = user_doc.get("user_id")
+                user_id = user_doc.get("user_id") or str(user_doc.get("_id"))
                 label = str(spam_prediction)
                 try:
                     score = float(label)
