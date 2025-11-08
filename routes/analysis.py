@@ -77,7 +77,11 @@ async def sync_sms(request: SmsSyncRequest, current_user: dict = Depends(get_cur
         if existing:
             continue
 
+        
         spam_score = await analyze_sms_text(msg.body)
+        if isinstance(spam_score, str) or spam_score is None:
+            spam_score = 0.0
+
 
         message_doc = {
             "user_id": user_id,
