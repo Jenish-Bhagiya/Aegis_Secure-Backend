@@ -40,7 +40,14 @@ async def _aggregate_collection_by_buckets(col, user_id_field, score_field, user
         match_stage,
         {
             "$project": {
-                "score": {"$toDouble": f"${score_field}"}
+                "score": {
+                    "$convert": {
+                        "input": f"${score_field}",
+                        "to": "double",
+                        "onError": 0.0,
+                        "onNull": 0.0
+                    }
+                }
             }
         },
         {
