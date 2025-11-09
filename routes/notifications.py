@@ -2,12 +2,11 @@ from fastapi import APIRouter, Request
 import httpx, os, json, base64
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from bson import ObjectId
 
 from database import messages_col, accounts_col, users_col
 from websocket_manager import broadcast_new_email
 from .fcm_service import send_fcm_notification_for_user
-
-from bson import ObjectId
 
 load_dotenv()
 
@@ -22,9 +21,7 @@ if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
     raise Exception("Google OAuth credentials missing.")
 
 
-# -------------------------------------------------------------
-#  Utility: Fetch access token
-# -------------------------------------------------------------
+#  Fetch access token
 async def get_access_token_from_refresh(refresh_token: str):
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -36,12 +33,11 @@ async def get_access_token_from_refresh(refresh_token: str):
                 "grant_type": "refresh_token"
             }
         )
-        return resp.json().get("access_token")
+        data = resp.json()
+        return data.get("access_token")
 
 
-# -------------------------------------------------------------
-#  Utility: Call ML model for spam prediction
-# -------------------------------------------------------------
+#  Call ML model for spam prediction
 async def get_spam_prediction(text: str):
     try:
         async with httpx.AsyncClient() as client:
@@ -54,9 +50,7 @@ async def get_spam_prediction(text: str):
         return "unknown"
 
 
-# -------------------------------------------------------------
 #  Gmail Push Notifications
-# -------------------------------------------------------------
 @router.post("/gmail/notifications")
 async def gmail_notifications(request: Request):
     try:
@@ -85,6 +79,9 @@ async def gmail_notifications(request: Request):
             print(f"⚠️ Failed to get access_token for {email_address}")
             return {"status": "error"}
 
+        # Default spam_prediction to safe value (in case nothing is found)
+        spam_prediction = 0.0
+
         async with httpx.AsyncClient() as client:
             start_history_id = user.get("last_history_id", history_id)
             history_resp = await client.get(
@@ -96,7 +93,10 @@ async def gmail_notifications(request: Request):
 
             for record in history_data.get("history", []):
                 for msg_event in record.get("messages", []):
-                    msg_id = msg_event["id"]
+                    msg_id = msg_event.get("id")
+                    if not msg_id:
+                        continue
+
                     msg_resp = await client.get(
                         f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}?format=full",
                         headers={"Authorization": f"Bearer {access_token}"}
@@ -114,12 +114,18 @@ async def gmail_notifications(request: Request):
                         spam_prediction = 0.0  # Treat unknown as safe (0)
 
                     await messages_col.update_one(
-                        {"user_id": user["user_id"], "gmail_email": email_address, "gmail_id": msg_id},
+                        {
+                            "user_id": user["user_id"],
+                            "gmail_email": email_address,
+                            "gmail_id": msg_id
+                        },
                         {"$set": {
                             "subject": subject,
                             "from": sender,
                             "snippet": snippet,
-                            "timestamp": int(msg_data.get("internalDate", datetime.now(timezone.utc).timestamp() * 1000)),
+                            "timestamp": int(
+                                msg_data.get("internalDate", datetime.now(timezone.utc).timestamp() * 1000)
+                            ),
                             "spam_prediction": spam_prediction,
                         }},
                         upsert=True
@@ -134,12 +140,10 @@ async def gmail_notifications(request: Request):
         # Notify all connected clients via WebSocket
         await broadcast_new_email(email_address)
 
-        # Send FCM push
+        # Send FCM push (with guaranteed variable existence)
         try:
-            # Try matching by both string user_id and ObjectId
             uid = user.get("user_id")
             query = {"$or": [{"user_id": uid}, {"_id": ObjectId(uid) if len(uid) == 24 else uid}]}
-
             user_doc = await users_col.find_one(query)
 
             if not user_doc:
