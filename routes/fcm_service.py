@@ -9,17 +9,23 @@ load_dotenv()
 
 
 def _init_firebase():
-    """Initialize Firebase Admin once (Base64 or local JSON support)."""
+    """Initialize Firebase Admin once (auto-fix for \\n issues)."""
     if firebase_admin._apps:
         return
 
     try:
-        # Prefer Base64 env var for Render (safe for long JSON)
+        # Try Base64-encoded JSON first (Render safe)
         b64_data = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64")
         creds_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
 
         if b64_data:
-            creds_dict = json.loads(base64.b64decode(b64_data))
+            decoded = base64.b64decode(b64_data)
+            creds_dict = json.loads(decoded)
+
+            # 🩹 Fix: Replace escaped newlines with real newlines in private key
+            if "private_key" in creds_dict:
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
             cred = credentials.Certificate(creds_dict)
             print("✅ Firebase initialized using Base64 environment variable.")
         elif creds_path and os.path.exists(creds_path):
