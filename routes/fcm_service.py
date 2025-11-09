@@ -9,6 +9,7 @@ load_dotenv()
 
 
 def _init_firebase():
+    print(f"🔥 Firebase Admin SDK version: {firebase_admin.__version__}")
     """Initialize Firebase Admin once (auto-fix for \\n issues)."""
     if firebase_admin._apps:
         return
