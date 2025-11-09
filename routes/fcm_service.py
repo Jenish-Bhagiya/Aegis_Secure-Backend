@@ -48,27 +48,53 @@ async def send_fcm_multicast(
     body: str,
     data: Optional[Dict[str, str]] = None
 ):
-    """Send notification to multiple device tokens."""
+    """Send notification to multiple device tokens (compatible for all firebase-admin versions)."""
     if not tokens:
         print("⚠️ No FCM tokens found — skipping push.")
         return {"success": 0, "failure": 0}
 
     await asyncio.to_thread(_init_firebase)
 
-    msg = messaging.MulticastMessage(
-        notification=messaging.Notification(title=title, body=body),
-        tokens=tokens,
-        data={k: str(v) for k, v in (data or {}).items()},
-    )
-
     try:
-        resp = await asyncio.to_thread(messaging.send_multicast, msg)
-        print(f"📤 FCM Push Sent: {resp.success_count} success, {resp.failure_count} fail.")
-        return {"success": resp.success_count, "failure": resp.failure_count}
+        # Prepare notification message
+        notification = messaging.Notification(title=title, body=body)
+        android_config = messaging.AndroidConfig(priority="high")
+        payload = {k: str(v) for k, v in (data or {}).items()}
+
+        # Check Firebase SDK version
+        if hasattr(messaging, "send_multicast"):
+            # ✅ New SDKs (v5+)
+            msg = messaging.MulticastMessage(
+                notification=notification,
+                tokens=tokens,
+                data=payload,
+                android=android_config,
+            )
+            resp = await asyncio.to_thread(messaging.send_multicast, msg)
+            print(f"📤 FCM Push Sent: {resp.success_count} success, {resp.failure_count} fail.")
+            return {"success": resp.success_count, "failure": resp.failure_count}
+        else:
+            # 🧩 Fallback for old SDKs — send individually
+            success, fail = 0, 0
+            for token in tokens:
+                msg = messaging.Message(
+                    notification=notification,
+                    token=token,
+                    data=payload,
+                    android=android_config,
+                )
+                try:
+                    await asyncio.to_thread(messaging.send, msg)
+                    success += 1
+                except Exception as e:
+                    print(f"⚠️ FCM send failed for token {token[:15]}...: {e}")
+                    fail += 1
+            print(f"📤 FCM Push Sent: {success} success, {fail} fail.")
+            return {"success": success, "failure": fail}
+
     except Exception as e:
         print("❌ Error sending FCM push:", e)
         return {"success": 0, "failure": len(tokens)}
-
 
 async def send_fcm_notification_for_user(
     user_id: str,
