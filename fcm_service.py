@@ -5,7 +5,6 @@ import base64
 import firebase_admin
 from firebase_admin import credentials, messaging
 
-
 def _init_firebase():
     print(f"🔥 Firebase Admin SDK version: {firebase_admin.__version__}")
 
