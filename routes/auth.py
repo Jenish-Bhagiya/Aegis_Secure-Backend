@@ -1,33 +1,28 @@
 # routes/auth.py
-from fastapi import APIRouter, HTTPException,Depends
-from pydantic import BaseModel
-from passlib.context import CryptContext
-import jwt
-import os
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials 
+from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Body
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
-from dotenv import load_dotenv
 from passlib.context import CryptContext
-from typing import Optional
-import datetime
+from dotenv import load_dotenv
+import datetime, jwt, os, base64
 
-security = HTTPBearer()
-load_dotenv()
-from database import users_col ,auth_db,otps_col
+from database import users_col, otps_col, accounts_col
 from routes import otp
-#imporitng the database column for authorization purpose
 
-from fastapi import Body
-from database import accounts_col
-
+load_dotenv()
 router = APIRouter()
+security = HTTPBearer()
+
 JWT_SECRET = os.getenv("JWT_SECRET", "supersecret")
 JWT_ALGORITHM = "HS256"
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-
+# ----------------------------
+# REQUEST MODELS
+# ----------------------------
 class RegisterRequest(BaseModel):
-    name:str
+    name: str
     email: str
     password: str
 
@@ -39,7 +34,6 @@ class LoginResponse(BaseModel):
     token: str
     verified: bool
 
-
 class SendOTPRequest(BaseModel):
     email: EmailStr
 
@@ -47,303 +41,153 @@ class VerifyOTPRequest(BaseModel):
     email: EmailStr
     otp: str
 
+class SetNotificationPref(BaseModel):
+    notification_pref: str  # "all" or "high_only"
 
-class UserResponse(BaseModel):
-    name: str
-    email: str
-    user_id: str
-
-
-#--⭐️
-
-class VerifyOTPRequest(BaseModel):
-    email: EmailStr
-    otp: str
-
-class VerifyResetOTPRequest(BaseModel):
-    email: EmailStr
-    otp: str
-
-class ResetPasswordRequest(BaseModel):
-    reset_token: str
-    new_password: str
-    confirm_password: str
+class FCMTokenRequest(BaseModel):
+    fcm_token: str
 
 
-RESET_JWT_TTL_MINUTES = int(os.getenv("RESET_JWT_TTL_MINUTES", "15"))
+# ----------------------------
+# PASSWORD UTILS
+# ----------------------------
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
-def hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
-
-def verify_password(plain: str, hashed: str) -> bool:
+def check_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
-
-def create_reset_jwt(email: str) -> str:
-    exp = datetime.datetime.utcnow() + datetime.timedelta(minutes=RESET_JWT_TTL_MINUTES)
-    payload = {"sub": email, "purpose": "password_reset", "exp": exp}
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    # pyjwt returns a str
-    return token
-
-def decode_reset_jwt(token: str) -> dict:
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        # validate purpose claim
-        if payload.get("purpose") != "password_reset":
-            raise HTTPException(status_code=401, detail="Invalid token purpose")
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Reset token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid reset token")
-
-#--⭐️
-    
-
-# --------------------------
-# Register endpoint
-# --------------------------
-
-    
-@router.post("/register")
-async def register_user(req: RegisterRequest):
-    existing = await users_col.find_one({"email": req.email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    # print("Raw request body:", body.decode())
-    # print("Parsed:", req.dict())
-    hashed_password = pwd_context.hash(req.password)
-    user_doc = {
-        "name": req.name,  # Added name field
-        "email": req.email,
-        "password": hashed_password,
-        "verified": False,
-        "user_id": str(datetime.datetime.now().timestamp())
-    }
-    await users_col.insert_one(user_doc)
-    # return {"message": "User registered. OTP verification pending."}
-
-
-    #<--⭐️
-    otp_code = otp.generate_otp()
-    await otp.store_otp(req.email, otp_code)
-    sent = await otp.send_otp_email_async(req.email, otp_code)
-
-    if sent:
-        return {"message": "User registered. OTP sent to email."}
-    else:
-        # fallback for dev mode (no SMTP credentials)
-        return {"message": f"User registered. OTP (dev mode): {otp_code}"}
-
-# --------------------------
-# Login endpoint
-# --------------------------
-@router.post("/login", response_model=LoginResponse)
-async def login_user(req: LoginRequest):
-    user = await users_col.find_one({"email": req.email})
-    if not user:
-        raise HTTPException(status_code=400, detail="User not found")
-    
-    if not pwd_context.verify(req.password, user["password"]):
-        raise HTTPException(status_code=400, detail="Incorrect password")
-    
-    payload = {
-        "email": user["email"],
-        "user_id": str(user["_id"]),
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=12)
-    }
-    
-    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-    return {"token": token,"verified": user.get("verified", False)}
-
-
-
-
-
-# -------- ⭐️
-
-@router.post("/send-otp")
-async def send_otp(req: SendOTPRequest):
-    # Check if user exists
-    user = await users_col.find_one({"email": req.email})
-    if not user:
-        raise HTTPException(status_code=400, detail="User not found")
-    
-    # Generate OTP
-    otp_code = otp.generate_otp()
-    
-    # Store OTP in DB
-    await otp.store_otp(req.email, otp_code)
-    
-    # Send OTP email
-    sent = await otp.send_otp_email_async(req.email, otp_code)
-    if sent:
-        return {"message": "OTP sent to your email."}
-    else:
-        return {"message": f"OTP generated (dev mode): {otp_code}"}
-
-@router.post("/verify-otp")
-async def verify_otp(req: VerifyOTPRequest):
-    print("📩 Incoming OTP verification request:", req.dict())  # Debug incoming payload
-
-    try:
-        is_valid = await otp.verify_otp_in_db(req.email, req.otp)
-        print(f"🧩 OTP validation result for {req.email}: {is_valid}")
-
-        if not is_valid:
-            raise HTTPException(status_code=400, detail="Invalid or expired OTP")
-
-        await users_col.update_one({"email": req.email}, {"$set": {"verified": True}})
-        print(f"✅ User {req.email} marked as verified")
-
-        return {"message": "OTP verified successfully, user is now verified."}
-
-    except Exception as e:
-        print(f"❌ Exception during OTP verify: {e}")
-        raise
 
 
 def decode_jwt(token: str):
     try:
-        decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return decoded
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
+    except:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-@router.get("/me")
-async def get_user_info(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Returns the name and email of the logged-in user."""
-    token = credentials.credentials
-    decoded = decode_jwt(token)
-    user = await users_col.find_one({"email": decoded["email"]})
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    decoded = decode_jwt(credentials.credentials)
+    email = decoded.get("email")
+    user = await users_col.find_one({"email": email})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    return {
-        "name": user["name"],
-        "email": user["email"],
-        "verified": user.get("verified", False),
+    user["user_id"] = str(user["_id"])
+    return user
+
+
+# ----------------------------
+# REGISTER
+# ----------------------------
+@router.post("/register")
+async def register(req: RegisterRequest):
+    if await users_col.find_one({"email": req.email}):
+        raise HTTPException(status_code=400, detail="Email already exists")
+
+    hashed_pw = hash_password(req.password)
+    user_doc = {
+        "name": req.name,
+        "email": req.email,
+        "password": hashed_pw,
+        "verified": False,
+        "avatar_base64": "",
+        "fcm_tokens": [],
+        "notification_pref": "all"
     }
+    await users_col.insert_one(user_doc)
+
+    otp_code = otp.generate_otp()
+    await otp.store_otp(req.email, otp_code)
+    await otp.send_otp_email_async(req.email, otp_code)
+
+    return {"message": "User created. OTP sent."}
 
 
+# ----------------------------
+# LOGIN
+# ----------------------------
+@router.post("/login", response_model=LoginResponse)
+async def login(req: LoginRequest):
+    user = await users_col.find_one({"email": req.email})
+    if not user or not check_password(req.password, user["password"]):
+        raise HTTPException(status_code=400, detail="Invalid credentials")
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """A dependency to get the current user from a JWT token."""
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        email: str = payload.get("email")
-        if email is None:
-            raise HTTPException(status_code=403, detail="Invalid token payload")
-
-        user = await users_col.find_one({"email": email})
-        if user is None:
-            raise HTTPException(status_code=404, detail="User not found")
-
-        user["user_id"] = str(user["_id"])
-        return user
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=403, detail="Token has expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    
-
-    
-@router.post("/forgot-password")
-async def forgot_password(req: SendOTPRequest):
-    """Generate OTP and send to user's email if the user exists.
-    Returns a generic message regardless of whether the email exists
-    (to avoid user enumeration)."""
-    email = req.email.lower()
-    user = await users_col.find_one({"email": email})
-
-    # If user exists -> store OTP & attempt to send email
-    if user:
-        otp_code = otp.generate_otp()
-        await otp.store_otp(email, otp_code)
-        sent = await otp.send_otp_email_async(email, otp_code)
-        if sent:
-            # generic success
-            return {"message": "If this email is registered, an OTP has been sent."}
-        else:
-            # dev fallback: still generic, but helpful in dev logs
-            print(f"[DEV] OTP for {email}: {otp_code}")
-            return {"message": "If this email is registered, an OTP has been sent."}
-    # If user doesn't exist, respond generically (do not store OTP)
-    return {"message": "If this email is registered, an OTP has been sent."}
-
-@router.post("/verify-reset-otp")
-async def verify_reset_otp(req: VerifyResetOTPRequest):
-    """Verify OTP for password reset. If valid, return a short-lived reset token."""
-    email = req.email.lower()
-    is_valid = await otp.verify_otp_in_db(email, req.otp)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
-
-    # create and return reset JWT
-    reset_token = create_reset_jwt(email)
-    return {"reset_token": reset_token, "expires_in_minutes": RESET_JWT_TTL_MINUTES}
-
-
-@router.post("/reset-password")
-async def reset_password(data: dict):
-    email = data.get("email")
-    otp = data.get("otp")
-    new_password = data.get("new_password")
-
-    if not all([email, otp, new_password]):
-        raise HTTPException(status_code=400, detail="Missing fields")
-
-    # ✅ Verify OTP (no need for "verified": True)
-    otp_doc = await otps_col.find_one({"email": email, "otp": otp})
-    if not otp_doc:
-        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
-
-    # ✅ Hash and update password
-    hashed_pw = pwd_context.hash(new_password)
-    result = await users_col.update_one(
-        {"email": email},
-        {"$set": {"password": hashed_pw}}
+    token = jwt.encode(
+        {"email": req.email, "user_id": str(user["_id"]), "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=12)},
+        JWT_SECRET, algorithm=JWT_ALGORITHM
     )
 
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="User not found")
+    return {"token": token, "verified": user.get("verified", False)}
 
-    await otps_col.delete_many({"email": email})
-    return {"message": "Password updated successfully"}
 
-@router.post("/register-fcm")
-async def register_fcm_token(payload: dict = Body(...), current_user: dict = Depends(get_current_user)):
-    """Register/update FCM device token."""
-    user_id = current_user.get("user_id")
-    token = payload.get("fcm_token")
-    if not user_id or not token:
-        raise HTTPException(status_code=400, detail="Missing user or token")
-    await users_col.update_one({"_id": current_user["_id"]}, {"$addToSet": {"fcm_tokens": token}}, upsert=True)
-    await accounts_col.update_many({"user_id": user_id}, {"$addToSet": {"fcm_tokens": token}})
-    return {"status": "ok", "message": "FCM token saved"}
+# ----------------------------
+# SEND OTP
+# ----------------------------
+@router.post("/send-otp")
+async def send_otp_now(req: SendOTPRequest):
+    if not await users_col.find_one({"email": req.email}):
+        raise HTTPException(status_code=400, detail="User not found")
 
-@router.post("/set-notification-pref")
-async def set_notification_preference(payload: dict = Body(...), current_user: dict = Depends(get_current_user)):
-    """Store notification preference: 'all' or 'high_only'."""
-    user_id = current_user.get("user_id")
-    pref = payload.get("notification_pref")
-    if pref not in ("all", "high_only"):
-        raise HTTPException(status_code=400, detail="Invalid preference")
-    await users_col.update_one({"_id": current_user["_id"]}, {"$set": {"notification_pref": pref}}, upsert=True)
-    await accounts_col.update_many({"user_id": user_id}, {"$set": {"notification_pref": pref}})
-    return {"status": "ok", "message": "Preference updated"}
+    otp_code = otp.generate_otp()
+    await otp.store_otp(req.email, otp_code)
+    await otp.send_otp_email_async(req.email, otp_code)
+    return {"message": "OTP sent"}
 
-@router.get("/fcm-info")
-async def get_fcm_info(current_user: dict = Depends(get_current_user)):
-    user = await users_col.find_one({"_id": current_user["_id"]})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+
+# ----------------------------
+# VERIFY OTP
+# ----------------------------
+@router.post("/verify-otp")
+async def otp_verify(req: VerifyOTPRequest):
+    if not await otp.verify_otp_in_db(req.email, req.otp):
+        raise HTTPException(status_code=400, detail="Invalid OTP")
+
+    await users_col.update_one({"email": req.email}, {"$set": {"verified": True}})
+    await otps_col.delete_many({"email": req.email})
+    return {"message": "Verified"}
+
+
+# ----------------------------
+# PROFILE
+# ----------------------------
+@router.get("/me")
+async def get_profile(current_user: dict = Depends(get_current_user)):
     return {
-        "email": user.get("email"),
-        "fcm_tokens": user.get("fcm_tokens", []),
-        "notification_pref": user.get("notification_pref", "all"),
+        "name": current_user.get("name"),
+        "email": current_user.get("email"),
+        "avatar_base64": current_user.get("avatar_base64", ""),
+        "notification_pref": current_user.get("notification_pref", "all")
     }
+
+
+@router.post("/me/avatar")
+async def upload_avatar(current_user: dict = Depends(get_current_user), file: UploadFile = File(...)):
+    contents = await file.read()
+    encoded = base64.b64encode(contents).decode("utf-8")
+    await users_col.update_one({"_id": current_user["_id"]}, {"$set": {"avatar_base64": encoded}})
+    return {"avatar_base64": encoded}
+
+
+# ----------------------------
+# STORE FCM TOKEN
+# ----------------------------
+@router.post("/register-fcm")
+async def save_fcm_token(req: FCMTokenRequest, current_user: dict = Depends(get_current_user)):
+    await users_col.update_one({"_id": current_user["_id"]}, {"$addToSet": {"fcm_tokens": req.fcm_token}})
+    await accounts_col.update_many({"user_id": current_user["user_id"]}, {"$addToSet": {"fcm_tokens": req.fcm_token}})
+    return {"status": "ok"}
+
+
+# ----------------------------
+# SET NOTIFICATION PREFERENCE
+# ----------------------------
+@router.post("/set-notification-pref")
+async def update_pref(pref: SetNotificationPref, current_user: dict = Depends(get_current_user)):
+    if pref.notification_pref not in ["all", "high_only"]:
+        raise HTTPException(status_code=400, detail="Invalid preference")
+
+    await users_col.update_one({"_id": current_user["_id"]}, {"$set": {"notification_pref": pref.notification_pref}})
+    await accounts_col.update_many({"user_id": current_user["user_id"]}, {"$set": {"notification_pref": pref.notification_pref}})
+    return {"status": "ok", "pref": pref.notification_pref}

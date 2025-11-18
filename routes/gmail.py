@@ -1,160 +1,185 @@
+# routes/gmail.py
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.security import OAuth2PasswordBearer
-from jose import jwt, JWTError
-from database import messages_col, accounts_col,avatars_col
-import time,os
-import re
+from database import messages_col, accounts_col, avatars_col
+from routes.auth import get_current_user
+from routes.notifications import process_message_and_notify
+from pydantic import BaseModel
+import httpx
+from datetime import datetime
+import base64, random, re, os
+
 router = APIRouter()
-JWT_SECRET = os.getenv("JWT_SECRET", "your_secret_key")
-ALGORITHM = "HS256"
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-@router.get("/gmail/state-token")
-def get_state_token(user_id: str):
-    payload = {
-        "user_id": user_id,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 300  # expires in 5 minutes
-    }
-    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-    return {"state": token}
-
-async def get_current_user_id(token: str = Depends(oauth2_scheme)):
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        user_id = payload.get("user_id")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Token missing user_id")
-        return user_id
-    except JWTError as e:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    
-@router.get("/emails")
-async def get_emails(
-    user_id: str = Depends(get_current_user_id),
-    account: str | None = None,
-):
-    """
-    Fetch emails for the authenticated user.
-    If `account` query param is provided, only return emails for that Gmail account.
-    """
-    try:
-        query = {"user_id": user_id}
-        if account:
-            query["gmail_email"] = account  # filter by selected Gmail account
-
-        emails_cursor = messages_col.find(query, {"_id": 0})
-        emails = await emails_cursor.to_list(length=None)
-
-        for e in emails:
-            if "timestamp" in e:
-                e["timestamp"] = int(e["timestamp"])
-            elif "date" in e:
-                e["timestamp"] = int(e.pop("date", 0))
-            else:
-                e["timestamp"] = 0
-
-        # ✅ Attach avatar URLs (from cache)
-        for e in emails:
-            sender_field = e.get("from", "")
-            match = re.search(r"<(.+?)>", sender_field)
-            sender_email = match.group(1) if match else sender_field
-            avatar_doc = await avatars_col.find_one({"email": sender_email})
-            e["char_color"] = avatar_doc.get("char_color") if avatar_doc else "#90A4AE"
-
-        # ✅ Sort newest first
-        emails_sorted = sorted(emails, key=lambda e: e.get("timestamp", 0), reverse=True)
-        return emails_sorted
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
 
+# ----------------------------
+# HELPER — Decode nested Gmail body
+# ----------------------------
+def extract_body(payload):
+    if not payload:
+        return ""
+
+    mime_type = payload.get("mimeType", "")
+    body_data = payload.get("body", {}).get("data")
+
+    if body_data and ("text/plain" in mime_type or "text/html" in mime_type):
+        try:
+            decoded = base64.urlsafe_b64decode(body_data).decode("utf-8", errors="ignore")
+            return decoded.strip()
+        except:
+            return ""
+
+    for part in payload.get("parts", []):
+        text = extract_body(part)
+        if text:
+            return text
+
+    return ""
 
 
-@router.get("/user/me")
-async def get_current_user(user_id: str):
-    user = await accounts_col.find_one({"user_id": user_id})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"name": user.get("name", "User"), "gmail_email": user.get("gmail_email")}
+# ----------------------------
+# OPTIONAL — Consistent avatar colors
+# ----------------------------
+COLOR_PALETTE = [
+    "#4285F4", "#EA4335", "#FBBC05", "#34A853", "#9C27B0", "#00ACC1", "#7E57C2",
+    "#FF7043", "#F06292", "#4DB6AC", "#1A237E", "#B71C1C", "#1B5E20", "#0D47A1",
+    "#F57F17", "#880E4F", "#004D40", "#311B92", "#BF360C", "#33691E", "#C62828",
+    "#283593", "#00695C", "#4527A0", "#E64A19", "#1976D2", "#AD1457", "#00838F",
+    "#5D4037", "#455A64"
+]
 
 
+async def resolve_sender_color(sender: str):
+    existing = await avatars_col.find_one({"email": sender})
+    if existing and "char_color" in existing:
+        return existing["char_color"]
 
-# --------------⭐️
-@router.get("/gmail/accounts")
-async def get_connected_accounts(user_id: str = Depends(get_current_user_id)):
-    """
-    Return all Gmail accounts connected by this user.
-    """
-    try:
-        accounts_cursor = accounts_col.find(
-            {"user_id": user_id},
-            {"_id": 0, "gmail_email": 1, "connected_at": 1}
+    color = random.choice(COLOR_PALETTE)
+    await avatars_col.update_one(
+        {"email": sender},
+        {"$set": {"char_color": color}},
+        upsert=True
+    )
+    return color
+
+
+# ----------------------------
+# ROUTE: Fetch inbox manually from device
+# ----------------------------
+class FetchRequest(BaseModel):
+    gmail_email: str
+
+
+@router.post("/gmail/fetch-latest")
+async def fetch_latest(req: FetchRequest, current_user: dict = Depends(get_current_user)):
+    gmail_email = req.gmail_email
+    user_id = current_user.get("user_id")
+
+    account = await accounts_col.find_one({"gmail_email": gmail_email, "user_id": user_id})
+    if not account or "refresh_token" not in account:
+        raise HTTPException(status_code=400, detail="Gmail account not linked")
+
+    # --------------------------------------------
+    # Refresh access token
+    # --------------------------------------------
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": account["refresh_token"],
+                "grant_type": "refresh_token"
+            }
         )
-        accounts = await accounts_cursor.to_list(length=None)
-        return {"accounts": accounts}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    
-@router.post("/accounts/delete")
-async def delete_connected_account(
-    payload: dict,
-    user_id: str = Depends(get_current_user_id)
-):
-    gmail_email = payload.get("gmail_email")
-    if not gmail_email:
-        raise HTTPException(status_code=400, detail="Missing gmail_email")
 
-    result = await accounts_col.delete_one(
-        {"user_id": user_id, "gmail_email": gmail_email}
-    )
-    msg_result = await messages_col.delete_many(
-        {"user_id": user_id, "gmail_email": gmail_email}
-    )
+    token_data = token_resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Failed to refresh access token")
 
-    if result.deleted_count == 0 or msg_result==0:
-        raise HTTPException(status_code=404, detail="Account not found")
+    # --------------------------------------------
+    # Pull last 10 Gmail messages
+    # --------------------------------------------
+    async with httpx.AsyncClient() as client:
+        inbox_resp = await client.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=10",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
 
-    return {"message": "Account deleted successfully"}
+    messages_list = inbox_resp.json().get("messages", [])
+    stored_count = 0
 
+    for msg in messages_list:
+        msg_id = msg.get("id")
+        if not msg_id:
+            continue
 
-@router.get("/emails/search")
-async def search_emails(q: str, user_id: str = Depends(get_current_user_id)):
-    if not q:
-        return []
+        # avoid duplicates
+        if await messages_col.find_one({"gmail_id": msg_id, "user_id": user_id}):
+            continue
 
-    try:
-        search_regex = re.compile(q, re.IGNORECASE)
-        query = {
+        # fetch full message data
+        async with httpx.AsyncClient() as client:
+            full_resp = await client.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}?format=full",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+
+        data = full_resp.json()
+
+        # extract headers
+        subject = ""
+        from_header = ""
+        for h in data["payload"]["headers"]:
+            if h["name"] == "Subject":
+                subject = h["value"]
+            if h["name"] == "From":
+                from_header = h["value"]
+
+        match = re.search(r"<(.+?)>", from_header)
+        sender = match.group(1) if match else from_header
+
+        body = extract_body(data.get("payload", {}))
+        snippet = data.get("snippet", "")
+        timestamp = int(data.get("internalDate", datetime.utcnow().timestamp() * 1000))
+
+        # run ML + optionally notify
+        result = await process_message_and_notify(
+            user_id=user_id,
+            message_text=body,
+            sender=sender,
+            channel="email"
+        )
+
+        # assign sender color
+        char_color = await resolve_sender_color(sender)
+
+        # final db object
+        email_doc = {
+            "gmail_id": msg_id,
+            "gmail_email": gmail_email,
             "user_id": user_id,
-            "$or": [
-                {"subject": {"$regex": search_regex}},
-                {"from": {"$regex": search_regex}},
-                {"snippet": {"$regex": search_regex}}
-            ]
+            "subject": subject,
+            "from": from_header,
+            "from_email": sender,
+            "char_color": char_color,
+            "snippet": snippet,
+            "body": body,
+            "timestamp": timestamp,
+
+            # ML score fields
+            "spam_score": result.get("score"),
+            "confidence": result.get("confidence"),
+            "reasoning": result.get("reasoning", ""),
+            "highlighted_text": result.get("highlighted_text", ""),
+            "final_decision": result.get("final_decision", ""),
+            "suggestion": result.get("suggestion", "")
         }
 
-        emails_cursor = messages_col.find(query, {"_id": 0})
-        emails = await emails_cursor.to_list(length=None)
+        await messages_col.insert_one(email_doc)
+        stored_count += 1
 
-        for e in emails:
-            e["timestamp"] = e.pop("date", 0)
-            if not isinstance(e["timestamp"], int):
-                e["timestamp"] = 0
-
-        # ✅ Attach avatar URLs
-        for e in emails:
-            sender_field = e.get("from", "")
-            match = re.search(r"<(.+?)>", sender_field)
-            sender_email = match.group(1) if match else sender_field
-
-            avatar_doc = await avatars_col.find_one({"email": sender_email})
-            e["char_color"] = avatar_doc.get("char_color") if avatar_doc else "#90A4AE"
-
-        emails_sorted = sorted(emails, key=lambda e: e.get("timestamp", 0), reverse=True)
-        return emails_sorted
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error during search: {e}")
+    return {"status": "ok", "new_inserted": stored_count}
