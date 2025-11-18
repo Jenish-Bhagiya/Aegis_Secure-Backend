@@ -1,81 +1,82 @@
 # fcm_service.py
 import os
 import json
-from dotenv import load_dotenv
-
+import base64
 import firebase_admin
 from firebase_admin import credentials, messaging
 
-load_dotenv()
 
-# 🔐 This must be in your .env as ONE line JSON:
-# FIREBASE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":...}
-FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+def _init_firebase():
+    print(f"🔥 Firebase Admin SDK version: {firebase_admin.__version__}")
 
-if not FIREBASE_SERVICE_ACCOUNT_JSON:
-    raise Exception("❌ FIREBASE_SERVICE_ACCOUNT_JSON is not set in .env")
-
-try:
-    # 1️⃣ Parse JSON from env
-    service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
-
-    # 2️⃣ Fix the private key (\\n → real newline)
-    if "private_key" in service_account_info and isinstance(service_account_info["private_key"], str):
-        service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
-
-    # 3️⃣ Initialize Firebase with dict (same pattern as your older code)
-    cred = credentials.Certificate(service_account_info)
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred)
-
-    print("✅ Firebase initialized from FIREBASE_SERVICE_ACCOUNT_JSON env")
-
-except Exception as e:
-    raise Exception(f"❌ Firebase initialization failed: {e}")
-
-
-async def send_fcm_notification(
-    tokens: list,
-    title: str,
-    body: str,
-    spam_score: float | None = None,
-    is_sms: bool = False,
-):
-    """
-    Send push notification via FCM.
-    - tokens: list of FCM device tokens
-    - title, body: notification UI
-    - spam_score: 0–100 score (optional)
-    - is_sms: True => SMS notification, False => Gmail
-    """
-    if not tokens:
-        print("⚠️ No FCM tokens, skipping notification.")
+    if firebase_admin._apps:
+        print("⚠️ Firebase already initialized.")
         return
 
-    data_payload = {
-        "type": "sms" if is_sms else "mail",
-        "spam_score": str(spam_score) if spam_score is not None else "",
-    }
+    try:
+        b64_data = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64")
+        creds_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
 
-    message = messaging.MulticastMessage(
-        notification=messaging.Notification(
-            title=title,
-            body=body,
-        ),
-        data=data_payload,
-        tokens=tokens,
+        if b64_data:
+            decoded = base64.b64decode(b64_data)
+            creds_dict = json.loads(decoded)
+
+            if "private_key" in creds_dict:
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
+            cred = credentials.Certificate(creds_dict)
+            print("✅ Firebase initialized using Base64 ENV variable.")
+        elif creds_path and os.path.exists(creds_path):
+            cred = credentials.Certificate(creds_path)
+            print("✅ Firebase initialized using service-account.json file.")
+        else:
+            raise RuntimeError("❌ FIREBASE_SERVICE_ACCOUNT_B64 or FIREBASE_SERVICE_ACCOUNT_PATH missing.")
+
+        firebase_admin.initialize_app(cred)
+        print("✅ Firebase Admin SDK ready.")
+
+    except Exception as e:
+        print("❌ Firebase initialization failed:", e)
+        raise
+
+
+# initialize automatically on import
+_init_firebase()
+
+
+def send_fcm_notification(
+    token: str = None,
+    title: str = "AegisSecure",
+    body: str = "",
+    data: dict = None,
+):
+    if not token:
+        print("❌ Cannot send FCM — token missing.")
+        return {"success": False, "error": "missing token"}
+
+    # FCM requires string-only data
+    safe_data = {}
+    if data:
+        for k, v in data.items():
+            safe_data[str(k)] = json.dumps(v) if not isinstance(v, str) else v
+
+    message = messaging.Message(
+        notification=messaging.Notification(title=title, body=body),
+        data=safe_data,
+        token=token,
+        android=messaging.AndroidConfig(
+            priority="high",
+            notification=messaging.AndroidNotification(
+                sound="default",
+                default_sound=True
+            )
+        )
     )
 
     try:
-        response = messaging.send_multicast(message)
-        print(
-            f"📨 FCM sent → success={response.success_count}, "
-            f"failed={response.failure_count}"
-        )
-        return {
-            "success": response.success_count,
-            "failure": response.failure_count,
-        }
+        message_id = messaging.send(message)
+        print(f"✅ FCM sent → {message_id}")
+        return {"success": True, "id": message_id}
     except Exception as e:
-        print(f"❌ Error sending FCM: {e}")
-        return None
+        print("❌ FCM send failed:", e)
+        return {"success": False, "error": str(e)}
