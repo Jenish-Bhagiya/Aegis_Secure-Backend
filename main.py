@@ -1,9 +1,9 @@
-# main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routes import auth, gmail, Oauth, notifications, sms
 
-app = FastAPI(title="Aegis Secure Backend API")
+from routes import auth, gmail, Oauth, notifications, sms, fcm
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,12 +14,13 @@ app.add_middleware(
 )
 
 # ROUTES
-app.include_router(auth.router, prefix="/auth", tags=["auth"])
-app.include_router(gmail.router, prefix="/gmail", tags=["gmail"])
-app.include_router(Oauth.router, tags=["oauth"])
-app.include_router(notifications.router, tags=["notifications"])
-app.include_router(sms.router, prefix="/sms", tags=["sms"])
+app.include_router(auth.router, prefix="/auth")
+app.include_router(gmail.router, prefix="/gmail")
+app.include_router(Oauth.router, prefix="/auth")
+app.include_router(notifications.router, prefix="/notifications")
+app.include_router(sms.router, prefix="/")
+app.include_router(fcm.router, prefix="/fcm")
 
 @app.get("/")
 async def root():
-    return {"status": "running", "app": "Aegis Secure Backend"}
+    return {"status": "ok", "message": "Aegis Secure Backend running"}
